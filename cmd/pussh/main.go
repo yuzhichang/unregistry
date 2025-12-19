@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
 	"net"
@@ -270,34 +271,55 @@ func transferunregImage() error {
 	return nil
 }
 
-func forwardPort(remotePort int) (int, error) {
-	localPort := 55000 + int(time.Now().UnixNano()%10000)
-	info("Establishing SSH tunnel: local:%d -> remote:%d", localPort, remotePort)
-	sshArgs := make([]string, len(cachedSSHArgs))
-	copy(sshArgs, cachedSSHArgs)
-	sshArgs = append(sshArgs, "-L", fmt.Sprintf("%d:127.0.0.1:%d", localPort, remotePort), "-N")
-	cmd := exec.Command("ssh", sshArgs...)
-	sshTunnel = cmd
-	if err := cmd.Start(); err != nil {
-		return 0, fmt.Errorf("failed to start SSH tunnel: %w", err)
+func isPortAvailable(port int) bool {
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		return false
 	}
+	ln.Close()
+	return true
+}
 
-	// Try to connect to the local port to verify tunnel is up
-	for i := 0; i < 40; i++ {
-		conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", localPort), 500*time.Millisecond)
-		if err == nil {
-			conn.Close()
-			return localPort, nil
+func forwardPort(remotePort int) (int, error) {
+	for attempt := 0; attempt < 10; attempt++ {
+		localPort := 55000 + int(time.Now().UnixNano()%10536)
+
+		// Check if port is already in use locally
+		if !isPortAvailable(localPort) {
+			continue
 		}
-		time.Sleep(250 * time.Millisecond)
+
+		info("Establishing SSH tunnel: local:%d -> remote:%d", localPort, remotePort)
+		sshArgs := make([]string, len(cachedSSHArgs))
+		copy(sshArgs, cachedSSHArgs)
+		sshArgs = append(sshArgs, "-L", fmt.Sprintf("%d:127.0.0.1:%d", localPort, remotePort), "-N")
+		cmd := exec.Command("ssh", sshArgs...)
+		sshTunnel = cmd
+		if err := cmd.Start(); err != nil {
+			// If SSH fails to start, try another port
+			continue
+		}
+
+		// Try to connect to the local port to verify tunnel is up
+		for i := 0; i < 40; i++ {
+			conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", localPort), 500*time.Millisecond)
+			if err == nil {
+				conn.Close()
+				return localPort, nil
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+
+		// Tunnel failed to establish, kill the process and try another port
+		if cmd.Process != nil {
+			cmd.Process.Kill()
+		}
 	}
-	return 0, fmt.Errorf("SSH tunnel timeout")
+	return 0, fmt.Errorf("failed to find an available local port to forward to remote unregistry port")
 }
 
 func startUnregistry(ns string) (int, error) {
-	port := 55000 + int(time.Now().UnixNano()%10000)
-	unregContainer = fmt.Sprintf("unreg-pussh-%d", time.Now().Unix())
-
+	// Ensure unregistry image exists on remote host before attempting to start container
 	if !checkImageExists(true, unregImage) {
 		if os.Getenv("UNREGISTRY_AIR_GAPPED") != "" {
 			if err := transferunregImage(); err != nil {
@@ -312,12 +334,33 @@ func startUnregistry(ns string) (int, error) {
 		}
 	}
 
-	info("Starting unregistry container '%s' on remote port %d...", unregContainer, port)
-	cmd, args := buildToolCmd(true, "", "run", "-d", "--name", unregContainer, "-v", fmt.Sprintf("%s:/run/containerd/containerd.sock", remoteSocket), "--net", "host", "--userns=host", "--user", "root:root", unregImage, "--addr", fmt.Sprintf("127.0.0.1:%d", port))
-	if err := runCmdWithLiveOutput(cmd, args...); err != nil {
-		return 0, fmt.Errorf("failed to start unregistry container: %w", err)
+	for attempt := 0; attempt < 10; attempt++ {
+		port := 55000 + int(time.Now().UnixNano()%10536)
+		unregContainer = fmt.Sprintf("unreg-pussh-%d-%d", time.Now().Unix(), port)
+
+		info("Starting unregistry container '%s' on remote port %d...", unregContainer, port)
+		cmd, args := buildToolCmd(true, "", "run", "-d", "--name", unregContainer, "-v", fmt.Sprintf("%s:/run/containerd/containerd.sock", remoteSocket), "--net", "host", "--userns=host", "--user", "root:root", unregImage, "--addr", fmt.Sprintf("127.0.0.1:%d", port))
+
+		// Run command and capture output to check for port binding errors
+		cmdObj := exec.Command(cmd, args...)
+		var stderr bytes.Buffer
+		cmdObj.Stderr = &stderr
+		if err := cmdObj.Run(); err != nil {
+			output := stderr.String()
+			// Remove the container that failed to start if it was created
+			cleanupCmd, cleanupArgs := buildToolCmd(true, "", "rm", "-f", unregContainer)
+			exec.Command(cleanupCmd, cleanupArgs...).Run()
+
+			// Check if the error is due to port binding
+			if strings.Contains(strings.ToLower(output), "bind") {
+				// Port binding conflict, try another port
+				continue
+			}
+			return 0, fmt.Errorf("failed to start unregistry container: %w\n%s", err, output)
+		}
+		return port, nil
 	}
-	return port, nil
+	return 0, fmt.Errorf("failed to start unregistry container after 10 attempts due to port binding conflicts")
 }
 
 func cleanup() {
