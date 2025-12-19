@@ -361,7 +361,7 @@ func handlePush() error {
 	}
 
 	pushArgs := []string{"push"}
-	if useDocker && *platform != "" {
+	if *platform != "" {
 		pushArgs = append(pushArgs, "--platform", *platform)
 	}
 	pushArgs = append(pushArgs, localTag)
@@ -421,7 +421,12 @@ func handlePull() error {
 		return fmt.Errorf("remote tag failed: %w", err)
 	}
 
-	cmd, args = buildToolCmd(true, foundNs, "push", remoteTag)
+	pushArgs := []string{"push"}
+	if *platform != "" {
+		pushArgs = append(pushArgs, "--platform", *platform)
+	}
+	pushArgs = append(pushArgs, remoteTag)
+	cmd, args = buildToolCmd(true, foundNs, pushArgs...)
 	if err := runCmdWithLiveOutput(cmd, args...); err != nil {
 		return fmt.Errorf("remote push failed: %w", err)
 	}
@@ -432,7 +437,12 @@ func handlePull() error {
 	}
 
 	info("Local - pulling image '%s' from registry via tunnel...", imgName)
-	cmd, args = buildToolCmd(false, imgNamespace, "pull", localTag)
+	pullArgs := []string{"pull"}
+	if *platform != "" {
+		pullArgs = append(pullArgs, "--platform", *platform)
+	}
+	pullArgs = append(pullArgs, localTag)
+	cmd, args = buildToolCmd(false, imgNamespace, pullArgs...)
 	if err := runCmdWithLiveOutput(cmd, args...); err != nil {
 		return fmt.Errorf("local pull failed: %w", err)
 	}
@@ -558,7 +568,7 @@ OPTIONS:
   --pull                    Pull mode (remote to local)
   -i, --ssh-key             Path to SSH private key
   --no-host-key-check       Skip SSH host key checking
-  --platform                Push a specific platform for multi-platform images
+  --platform                Specify a platform for multi-platform images
 `)
 	}
 	flag.Parse()
