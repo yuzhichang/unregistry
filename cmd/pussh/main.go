@@ -27,13 +27,6 @@ var (
 	imgName        string
 	imgNamespace   string
 	remoteHost     string
-	useDocker      bool
-	remoteTool     string
-	remoteToolSudo string
-	remoteSocket   string
-	localTool      string
-	localToolSudo  string
-	localSocket    string
 	sshTunnel      *exec.Cmd
 	unregContainer string
 )
@@ -55,6 +48,38 @@ var toolDirectories = []string{
 	"/opt/docker/bin/",
 	"/snap/bin/",
 	"/storage/.docker/bin",
+}
+
+type ToolInfo struct {
+	IsRemote bool
+	Name     string
+	Path     string
+	Sudo     string
+	Socket   string
+}
+
+var toolInfos = []ToolInfo{
+	{IsRemote: false},
+	{IsRemote: true},
+}
+
+func getToolInfo(isRemote bool) *ToolInfo {
+	for i := range len(toolInfos) {
+		if toolInfos[i].IsRemote == isRemote {
+			return &toolInfos[i]
+		}
+	}
+	return nil
+}
+
+func getHostname(isRemote bool) string {
+	if isRemote {
+		return remoteHost
+	}
+	if hostname, err := os.Hostname(); err == nil {
+		return hostname
+	}
+	return "local"
 }
 
 var unregImage = func() string {
@@ -87,6 +112,7 @@ func logPrintf(level, format string, v ...any) {
 }
 
 func info(format string, v ...any) { logPrintf("INFO", format, v...) }
+
 func debug(format string, v ...any) {
 	if *verbose {
 		logPrintf("DEBU", format, v...)
@@ -128,19 +154,17 @@ func findContainerdSocket(isRemote bool) (string, string) {
 
 func buildToolCmd(isRemote bool, ns string, args ...string) (string, []string) {
 	var parts []string
-	var tool, toolSudo, socket string
-	if isRemote {
-		tool, toolSudo, socket = remoteTool, remoteToolSudo, remoteSocket
-	} else {
-		tool, toolSudo, socket = localTool, localToolSudo, localSocket
+	toolInfo := getToolInfo(isRemote)
+	if toolInfo == nil {
+		return "", nil
 	}
-	if toolSudo != "" {
-		parts = append(parts, toolSudo)
+	if toolInfo.Sudo != "" {
+		parts = append(parts, toolInfo.Sudo)
 	}
-	parts = append(parts, tool)
-	if !useDocker {
-		if socket != "" {
-			parts = append(parts, "--address", socket)
+	parts = append(parts, toolInfo.Path)
+	if toolInfo.Name != "docker" {
+		if toolInfo.Socket != "" {
+			parts = append(parts, "--address", toolInfo.Socket)
 		}
 		if ns != "" {
 			parts = append(parts, "--namespace", ns)
@@ -159,7 +183,7 @@ func buildToolCmd(isRemote bool, ns string, args ...string) (string, []string) {
 		cmd = "bash"
 		args2 = []string{"-c", shellCmd}
 	}
-	debug("Executing: %s %q", cmd, args2)
+	info("Executing: %s %q", cmd, args2)
 	return cmd, args2
 }
 
@@ -178,9 +202,6 @@ func checkImageExists(isRemote bool, image string) bool {
 }
 
 func listNamespaces(isRemote bool) ([]string, error) {
-	if useDocker {
-		return []string{"default"}, nil
-	}
 	cmd, args := buildToolCmd(isRemote, "", "namespace", "ls")
 	output, err := exec.Command(cmd, args...).Output()
 	if err != nil {
@@ -201,38 +222,65 @@ func listNamespaces(isRemote bool) ([]string, error) {
 	return namespaces, nil
 }
 
+// findImage finds an image in nerdctl namespaces, falling back to docker if not found.
 func findImage(isRemote bool, name, preferNamespace string) (string, error) {
-	if useDocker {
-		if checkImageExists(isRemote, name) {
-			return "", nil
+	hostname := getHostname(isRemote)
+	info(fmt.Sprintf("Detecting sender(%s) environment...", hostname))
+	toolInfo := getToolInfo(isRemote)
+	toolInfo.Socket, _ = findContainerdSocket(isRemote)
+	for _, toolName := range []string{"nerdctl", "docker"} {
+		if tool, toolSudo, err := checkTool(isRemote, toolName, toolInfo.Socket); err == nil {
+			toolInfo.Name = toolName
+			toolInfo.Path, toolInfo.Sudo = tool, toolSudo
+			info("%s tool: %s (sudo: %v), socket: %s", hostname, toolInfo.Path, toolInfo.Sudo != "", toolInfo.Socket)
+			break
 		}
-		return "", fmt.Errorf("image '%s' not found in Docker", name)
+	}
+	if toolInfo.Name == "" {
+		return "", fmt.Errorf("%s: neither nerdctl nor docker works!", hostname)
 	}
 
-	namespaces, err := listNamespaces(isRemote)
-	if err != nil {
-		return "", err
-	}
-	var targetNS []string
-	for _, ns := range namespaces {
-		if ns == preferNamespace {
-			targetNS = append([]string{ns}, targetNS...)
+	if toolInfo.Name == "nerdctl" {
+		namespaces, err := listNamespaces(isRemote)
+		if err != nil {
+			return "", err
+		}
+		var targetNS []string
+		for _, ns := range namespaces {
+			if ns == preferNamespace {
+				targetNS = append([]string{ns}, targetNS...)
+			} else {
+				targetNS = append(targetNS, ns)
+			}
+		}
+
+		for _, ns := range targetNS {
+			cmd, args := buildToolCmd(isRemote, ns, "image", "inspect", name)
+			if exec.Command(cmd, args...).Run() == nil {
+				info(fmt.Sprintf("%s image '%s' found in namespace '%s' in nerdctl", hostname, name, ns))
+				return ns, nil
+			}
+		}
+
+		info(fmt.Sprintf("%s switching to docker", hostname))
+		if tool, toolSudo, err := checkTool(isRemote, "docker", toolInfo.Socket); err != nil {
+			return "", err
 		} else {
-			targetNS = append(targetNS, ns)
+			toolInfo.Name = "docker"
+			toolInfo.Path, toolInfo.Sudo = tool, toolSudo
+			info("%s tool: %s (sudo: %v), socket: %s", hostname, toolInfo.Path, toolInfo.Sudo != "", toolInfo.Socket)
 		}
 	}
-
-	for _, ns := range targetNS {
-		cmd, args := buildToolCmd(isRemote, ns, "image", "inspect", name)
-		if exec.Command(cmd, args...).Run() == nil {
-			return ns, nil
-		}
+	if checkImageExists(isRemote, name) {
+		return "", nil
 	}
-	return "", fmt.Errorf("image '%s' not found in any namespace", name)
+	info(fmt.Sprintf("%s image '%s' not found in docker", hostname, name))
+	return "", fmt.Errorf("%s image '%s' not found in Docker", hostname, name)
 }
 
 // --- Infrastructure ---
 
+// transferunregImage transfers unregistry image to remote host via SCP.
 func transferunregImage() error {
 	if !checkImageExists(false, unregImage) {
 		info("Unregistry image not found locally, pulling...")
@@ -271,6 +319,7 @@ func transferunregImage() error {
 	return nil
 }
 
+// isPortAvailable checks if a local TCP port is available.
 func isPortAvailable(port int) bool {
 	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
@@ -280,6 +329,7 @@ func isPortAvailable(port int) bool {
 	return true
 }
 
+// forwardPort establishes SSH tunnel to given remote port, returns local port.
 func forwardPort(remotePort int) (int, error) {
 	for attempt := 0; attempt < 10; attempt++ {
 		localPort := 55000 + int(time.Now().UnixNano()%10536)
@@ -318,28 +368,25 @@ func forwardPort(remotePort int) (int, error) {
 	return 0, fmt.Errorf("failed to find an available local port to forward to remote unregistry port")
 }
 
+// startUnregistry starts unregistry container on remote host.
 func startUnregistry(ns string) (int, error) {
 	// Ensure unregistry image exists on remote host before attempting to start container
 	if !checkImageExists(true, unregImage) {
-		if os.Getenv("UNREGISTRY_AIR_GAPPED") != "" {
-			if err := transferunregImage(); err != nil {
-				return 0, err
-			}
-		} else {
-			info("Pulling unregistry image on remote...")
-			cmd, args := buildToolCmd(true, "", "pull", unregImage)
-			if err := runCmdWithLiveOutput(cmd, args...); err != nil {
-				return 0, fmt.Errorf("failed to pull unregistry image on remote: %w", err)
-			}
+		if err := transferunregImage(); err != nil {
+			return 0, err
 		}
 	}
 
+	if ns == "" {
+		ns = "moby"
+	}
 	for attempt := 0; attempt < 10; attempt++ {
 		port := 55000 + int(time.Now().UnixNano()%10536)
 		unregContainer = fmt.Sprintf("unreg-pussh-%d-%d", time.Now().Unix(), port)
+		toolInfo := getToolInfo(true)
 
 		info("Starting unregistry container '%s' on remote port %d...", unregContainer, port)
-		cmd, args := buildToolCmd(true, "", "run", "-d", "--name", unregContainer, "-v", fmt.Sprintf("%s:/run/containerd/containerd.sock", remoteSocket), "--net", "host", "--userns=host", "--user", "root:root", unregImage, "--addr", fmt.Sprintf("127.0.0.1:%d", port))
+		cmd, args := buildToolCmd(true, "", "run", "-d", "--name", unregContainer, "-v", fmt.Sprintf("%s:/run/containerd/containerd.sock", toolInfo.Socket), "--net", "host", "--userns=host", "--user", "root:root", unregImage, "--addr", fmt.Sprintf("127.0.0.1:%d", port), "--namespace", ns)
 
 		// Run command and capture output to check for port binding errors
 		cmdObj := exec.Command(cmd, args...)
@@ -363,6 +410,7 @@ func startUnregistry(ns string) (int, error) {
 	return 0, fmt.Errorf("failed to start unregistry container after 10 attempts due to port binding conflicts")
 }
 
+// cleanup cleans up SSH tunnel and remote unregistry container.
 func cleanup() {
 	info("Cleaning up tunnel and remote container...")
 	if sshTunnel != nil && sshTunnel.Process != nil {
@@ -378,13 +426,32 @@ func cleanup() {
 
 // --- Handlers ---
 
+// handlePush pushes an image from local to remote.
 func handlePush() error {
+	hostname := getHostname(true)
+	info("Detecting receiver(%s) environment...", hostname)
+	toolInfo := getToolInfo(true)
+	toolInfo.Socket, _ = findContainerdSocket(true)
+	toolName := "nerdctl"
+	if imgNamespace == "" {
+		toolName = "docker"
+	}
+
+	if tool, toolSudo, err := checkTool(true, toolName, toolInfo.Socket); err != nil {
+		return err
+	} else {
+		toolInfo.Name = toolName
+		toolInfo.Path = tool
+		toolInfo.Sudo = toolSudo
+		info("%s tool: %s (sudo: %v), socket: %s", hostname, toolInfo.Path, toolInfo.Sudo != "", toolInfo.Socket)
+	}
+
 	foundNs, err := findImage(false, imgName, imgNamespace)
 	if err != nil {
 		return err
 	}
 
-	rPort, err := startUnregistry(foundNs)
+	rPort, err := startUnregistry(imgNamespace)
 	if err != nil {
 		return err
 	}
@@ -403,7 +470,7 @@ func handlePush() error {
 		return fmt.Errorf("local tag failed: %w", err)
 	}
 
-	pushArgs := []string{"push"}
+	pushArgs := []string{"push", "--quiet"}
 	if *platform != "" {
 		pushArgs = append(pushArgs, "--platform", *platform)
 	}
@@ -421,7 +488,12 @@ func handlePush() error {
 	// The tag/rmi workflow can be bypassed to save approximately 1s if the containerd.snapshotter mechanism is enabled.
 	// Note that unlike "docker info", "nerdctl info" provides no reliable way to detect this state.
 	info("Remote - pulling image '%s' from registry...", imgName)
-	cmd, args = buildToolCmd(true, imgNamespace, "pull", remoteTag)
+	pullArgs := []string{"pull", "--quiet"}
+	if *platform != "" {
+		pullArgs = append(pullArgs, "--platform", *platform)
+	}
+	pullArgs = append(pullArgs, remoteTag)
+	cmd, args = buildToolCmd(true, imgNamespace, pullArgs...)
 	if err := runCmdWithLiveOutput(cmd, args...); err != nil {
 		return fmt.Errorf("remote pull failed: %w", err)
 	}
@@ -439,7 +511,26 @@ func handlePush() error {
 	return nil
 }
 
+// handlePull pulls an image from remote to local.
 func handlePull() error {
+	hostname := getHostname(false)
+	info("Detecting receiver(%s) environment...", hostname)
+	toolInfo := getToolInfo(false)
+	toolInfo.Socket, _ = findContainerdSocket(false)
+	toolName := "nerdctl"
+	if imgNamespace == "" {
+		toolName = "docker"
+	}
+
+	if tool, toolSudo, err := checkTool(false, toolName, toolInfo.Socket); err != nil {
+		return err
+	} else {
+		toolInfo.Name = toolName
+		toolInfo.Path = tool
+		toolInfo.Sudo = toolSudo
+		info("%s tool: %s (sudo: %v), socket: %s", hostname, toolInfo.Path, toolInfo.Sudo != "", toolInfo.Socket)
+	}
+
 	foundNs, err := findImage(true, imgName, imgNamespace)
 	if err != nil {
 		return err
@@ -464,7 +555,7 @@ func handlePull() error {
 		return fmt.Errorf("remote tag failed: %w", err)
 	}
 
-	pushArgs := []string{"push"}
+	pushArgs := []string{"push", "--quiet"}
 	if *platform != "" {
 		pushArgs = append(pushArgs, "--platform", *platform)
 	}
@@ -480,7 +571,7 @@ func handlePull() error {
 	}
 
 	info("Local - pulling image '%s' from registry via tunnel...", imgName)
-	pullArgs := []string{"pull"}
+	pullArgs := []string{"pull", "--quiet"}
 	if *platform != "" {
 		pullArgs = append(pullArgs, "--platform", *platform)
 	}
@@ -505,12 +596,8 @@ func handlePull() error {
 
 // --- Detection ---
 
-func checkTool(isRemote bool) (string, string, error) {
-	toolName := "nerdctl"
-	if useDocker {
-		toolName = "docker"
-	}
-
+// checkTool finds container tool (docker/nerdctl) and required sudo prefix.
+func checkTool(isRemote bool, toolName, socket string) (string, string, error) {
 	var paths []string
 	whichCmd := "which " + toolName
 	if out, err := (func() ([]byte, error) {
@@ -528,12 +615,8 @@ func checkTool(isRemote bool) (string, string, error) {
 
 	for _, p := range paths {
 		testCmd := p + " image ls"
-		if !useDocker {
-			if isRemote {
-				testCmd += fmt.Sprintf(" --address %s", remoteSocket)
-			} else {
-				testCmd += fmt.Sprintf(" --address %s", localSocket)
-			}
+		if toolName != "docker" {
+			testCmd += fmt.Sprintf(" --address %s", socket)
 		}
 		debug("Testing tool path %s", p)
 		if isRemote {
@@ -561,36 +644,20 @@ func checkTool(isRemote bool) (string, string, error) {
 	return "", "", fmt.Errorf("tool '%s' not found or accessible", toolName)
 }
 
+// run is the main entry point after flag parsing.
 func run() error {
 	image, host := flag.Arg(0), flag.Arg(1)
-	useDocker = !strings.Contains(image, "::")
-	imgName = image
-	if !useDocker {
-		parts := strings.SplitN(image, "::", 2)
+	parts := strings.SplitN(image, "::", 2)
+	if len(parts) == 2 {
 		imgNamespace, imgName = parts[0], parts[1]
+	} else {
+		imgNamespace, imgName = "", image
 	}
 	remoteHost = host
 	cachedSSHArgs = buildSSHArgs()
 
 	// Use defer to ensure cleanup happens even if an error occurs later
 	defer cleanup()
-
-	info("Detecting local environment...")
-	localSocket, _ = findContainerdSocket(false)
-	var err error
-	localTool, localToolSudo, err = checkTool(false)
-	if err != nil {
-		return err
-	}
-	info("Local tool: %s (sudo: %v), socket: %s", localTool, localToolSudo != "", localSocket)
-
-	info("Detecting remote environment on %s...", host)
-	remoteSocket, _ = findContainerdSocket(true)
-	remoteTool, remoteToolSudo, err = checkTool(true)
-	if err != nil {
-		return err
-	}
-	info("Remote tool: %s (sudo: %v), socket: %s", remoteTool, remoteToolSudo != "", remoteSocket)
 
 	if *pull {
 		return handlePull()
@@ -603,6 +670,14 @@ func main() {
 		fmt.Print(`pussh - Push/pull container images via SSH without external registries.
 
 USAGE: pussh [OPTIONS] IMAGE HOST
+
+IMAGE format:
+  - <image>:tag             Sender uses nerdctl to search the image in all namespaces first.
+                            If not found in any namespace, sender falls back to docker.
+                            Receiver uses docker to store the image.
+  - <namespace>::<image>:tag Sender uses nerdctl to search the image in the given namespace first, then other namespaces.
+                            If not found in any namespace, sender falls back to docker.
+                            Receiver uses nerdctl to store the image in the given namespace.
 
 OPTIONS:
   -h, --help                Show help
