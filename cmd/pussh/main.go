@@ -39,17 +39,6 @@ var containerdSocketPaths = []string{
 	"/run/snap.docker/containerd/containerd.sock",
 }
 
-var toolDirectories = []string{
-	".",
-	".local/bin/",
-	"/usr/local/bin/",
-	"/usr/bin/",
-	"/usr/sbin/",
-	"/opt/docker/bin/",
-	"/snap/bin/",
-	"/storage/.docker/bin",
-}
-
 type ToolInfo struct {
 	IsRemote bool
 	Name     string
@@ -121,33 +110,27 @@ func debug(format string, v ...any) {
 
 // --- Path and Socket Helpers ---
 
-func findContainerdSocket(isRemote bool) (string, string) {
+func findContainerdSocket(isRemote bool) (string, error) {
 	for _, p := range containerdSocketPaths {
-		testCmd := fmt.Sprintf("test -S %s", p)
-		debug("Testing socket path: %s", p)
+		testCmd := fmt.Sprintf("sudo -n test -S %s", p)
+		info("Testing socket path: %s", p)
 		if isRemote {
 			sshArgs := make([]string, len(cachedSSHArgs))
 			copy(sshArgs, cachedSSHArgs)
 			sshArgs = append(sshArgs, testCmd)
+			debug("Executing: %s %q", "ssh", sshArgs)
 			if exec.Command("ssh", sshArgs...).Run() == nil {
-				return p, ""
-			}
-			sshArgsSudo := make([]string, len(cachedSSHArgs))
-			copy(sshArgsSudo, cachedSSHArgs)
-			sshArgsSudo = append(sshArgsSudo, "sudo -n "+testCmd)
-			if exec.Command("ssh", sshArgsSudo...).Run() == nil {
-				return p, "sudo -n"
+				return p, nil
 			}
 		} else {
-			if exec.Command("sh", "-c", testCmd).Run() == nil {
-				return p, ""
-			}
-			if exec.Command("sh", "-c", "sudo -n "+testCmd).Run() == nil {
-				return p, "sudo -n"
+			args := []string{"-c", testCmd}
+			debug("Executing: %s %q", "sh", args)
+			if exec.Command("sh", args...).Run() == nil {
+				return p, nil
 			}
 		}
 	}
-	return "", ""
+	return "", fmt.Errorf("containerd socket not found")
 }
 
 // --- Command String Builders ---
@@ -183,7 +166,7 @@ func buildToolCmd(isRemote bool, ns string, args ...string) (string, []string) {
 		cmd = "bash"
 		args2 = []string{"-c", shellCmd}
 	}
-	info("Executing: %s %q", cmd, args2)
+	debug("Executing: %s %q", cmd, args2)
 	return cmd, args2
 }
 
@@ -227,7 +210,10 @@ func findImage(isRemote bool, name, preferNamespace string) (string, error) {
 	hostname := getHostname(isRemote)
 	info(fmt.Sprintf("Detecting sender(%s) environment...", hostname))
 	toolInfo := getToolInfo(isRemote)
-	toolInfo.Socket, _ = findContainerdSocket(isRemote)
+	var err error
+	if toolInfo.Socket, err = findContainerdSocket(isRemote); err != nil {
+		return "", err
+	}
 	for _, toolName := range []string{"nerdctl", "docker"} {
 		if tool, toolSudo, err := checkTool(isRemote, toolName, toolInfo.Socket); err == nil {
 			toolInfo.Name = toolName
@@ -339,7 +325,7 @@ func forwardPort(remotePort int) (int, error) {
 			continue
 		}
 
-		info("Establishing SSH tunnel: local:%d -> remote:%d", localPort, remotePort)
+		info("Establishing SSH tunnel: %s:%d -> %s:%d", getHostname(false), localPort, getHostname(true), remotePort)
 		sshArgs := make([]string, len(cachedSSHArgs))
 		copy(sshArgs, cachedSSHArgs)
 		sshArgs = append(sshArgs, "-L", fmt.Sprintf("%d:127.0.0.1:%d", localPort, remotePort), "-N")
@@ -431,7 +417,10 @@ func handlePush() error {
 	hostname := getHostname(true)
 	info("Detecting receiver(%s) environment...", hostname)
 	toolInfo := getToolInfo(true)
-	toolInfo.Socket, _ = findContainerdSocket(true)
+	var err error
+	if toolInfo.Socket, err = findContainerdSocket(true); err != nil {
+		return err
+	}
 	toolName := "nerdctl"
 	if imgNamespace == "" {
 		toolName = "docker"
@@ -516,7 +505,10 @@ func handlePull() error {
 	hostname := getHostname(false)
 	info("Detecting receiver(%s) environment...", hostname)
 	toolInfo := getToolInfo(false)
-	toolInfo.Socket, _ = findContainerdSocket(false)
+	var err error
+	if toolInfo.Socket, err = findContainerdSocket(false); err != nil {
+		return err
+	}
 	toolName := "nerdctl"
 	if imgNamespace == "" {
 		toolName = "docker"
@@ -599,18 +591,21 @@ func handlePull() error {
 // checkTool finds container tool (docker/nerdctl) and required sudo prefix.
 func checkTool(isRemote bool, toolName, socket string) (string, string, error) {
 	var paths []string
-	whichCmd := "which " + toolName
+	whichCmd := "which -a " + toolName
 	if out, err := (func() ([]byte, error) {
 		if isRemote {
+			debug("Executing: %s %q", "ssh", []string{remoteHost, whichCmd})
 			return exec.Command("ssh", remoteHost, whichCmd).Output()
 		}
+		debug("Executing: %s %q", "sh", []string{"-c", whichCmd})
 		return exec.Command("sh", "-c", whichCmd).Output()
 	})(); err == nil {
-		paths = append(paths, strings.TrimSpace(string(out)))
-	}
-
-	for _, dir := range toolDirectories {
-		paths = append(paths, filepath.Join(dir, toolName))
+		paths = strings.Split(strings.TrimSpace(string(out)), "\n")
+		if len(paths) == 0 {
+			return "", "", fmt.Errorf("failed to locate tool '%s'", toolName)
+		}
+	} else {
+		return "", "", fmt.Errorf("failed to locate tool '%s': %w", toolName, err)
 	}
 
 	for _, p := range paths {
@@ -623,19 +618,23 @@ func checkTool(isRemote bool, toolName, socket string) (string, string, error) {
 			sshArgs := make([]string, len(cachedSSHArgs))
 			copy(sshArgs, cachedSSHArgs)
 			sshArgs = append(sshArgs, testCmd)
+			debug("Executing: %s %q", "ssh", sshArgs)
 			if exec.Command("ssh", sshArgs...).Run() == nil {
 				return p, "", nil
 			}
 			sshArgsSudo := make([]string, len(cachedSSHArgs))
 			copy(sshArgsSudo, cachedSSHArgs)
 			sshArgsSudo = append(sshArgsSudo, "sudo -n "+testCmd)
+			debug("Executing: %s %q", "ssh", sshArgsSudo)
 			if exec.Command("ssh", sshArgsSudo...).Run() == nil {
 				return p, "sudo -n", nil
 			}
 		} else {
+			debug("Executing: %s %q", "sh", []string{"-c", testCmd})
 			if exec.Command("sh", "-c", testCmd).Run() == nil {
 				return p, "", nil
 			}
+			debug("Executing: %s %q", "sh", []string{"-c", "sudo -n " + testCmd})
 			if exec.Command("sh", "-c", "sudo -n "+testCmd).Run() == nil {
 				return p, "sudo -n", nil
 			}
